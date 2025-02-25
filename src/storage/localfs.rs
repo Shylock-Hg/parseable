@@ -17,7 +17,7 @@
  */
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -32,16 +32,16 @@ use relative_path::{RelativePath, RelativePathBuf};
 use tokio::fs::{self, DirEntry};
 use tokio_stream::wrappers::ReadDirStream;
 
-use crate::option::validation;
 use crate::{
     handlers::http::users::USERS_ROOT_DIR,
-    metrics::storage::{localfs::REQUEST_RESPONSE_TIME, StorageMetrics},
+    metrics::storage::{azureblob::REQUEST_RESPONSE_TIME, StorageMetrics},
+    option::validation,
+    parseable::LogStream,
 };
 
 use super::{
-    LogStream, ObjectStorage, ObjectStorageError, ObjectStorageProvider,
-    CORRELATIONS_ROOT_DIRECTORY, PARSEABLE_ROOT_DIRECTORY, SCHEMA_FILE_NAME,
-    STREAM_METADATA_FILE_NAME, STREAM_ROOT_DIRECTORY,
+    ObjectStorage, ObjectStorageError, ObjectStorageProvider, ALERTS_ROOT_DIRECTORY,
+    PARSEABLE_ROOT_DIRECTORY, SCHEMA_FILE_NAME, STREAM_METADATA_FILE_NAME, STREAM_ROOT_DIRECTORY,
 };
 
 #[derive(Debug, Clone, clap::Args)]
@@ -64,6 +64,10 @@ pub struct FSConfig {
 }
 
 impl ObjectStorageProvider for FSConfig {
+    fn name(&self) -> &'static str {
+        "drive"
+    }
+
     fn get_datafusion_runtime(&self) -> RuntimeEnvBuilder {
         RuntimeEnvBuilder::new()
     }
@@ -296,12 +300,12 @@ impl ObjectStorage for LocalFS {
         Ok(fs::remove_file(path).await?)
     }
 
-    async fn list_streams(&self) -> Result<Vec<LogStream>, ObjectStorageError> {
+    async fn list_streams(&self) -> Result<HashSet<LogStream>, ObjectStorageError> {
         let ignore_dir = &[
             "lost+found",
             PARSEABLE_ROOT_DIRECTORY,
             USERS_ROOT_DIR,
-            CORRELATIONS_ROOT_DIRECTORY,
+            ALERTS_ROOT_DIRECTORY,
         ];
         let directories = ReadDirStream::new(fs::read_dir(&self.root).await?);
         let entries: Vec<DirEntry> = directories.try_collect().await?;
@@ -312,20 +316,16 @@ impl ObjectStorage for LocalFS {
         let logstream_dirs: Vec<Option<String>> =
             FuturesUnordered::from_iter(entries).try_collect().await?;
 
-        let logstreams = logstream_dirs
-            .into_iter()
-            .flatten()
-            .map(|name| LogStream { name })
-            .collect();
+        let logstreams = logstream_dirs.into_iter().flatten().collect();
 
         Ok(logstreams)
     }
 
-    async fn list_old_streams(&self) -> Result<Vec<LogStream>, ObjectStorageError> {
+    async fn list_old_streams(&self) -> Result<HashSet<LogStream>, ObjectStorageError> {
         let ignore_dir = &[
             "lost+found",
             PARSEABLE_ROOT_DIRECTORY,
-            CORRELATIONS_ROOT_DIRECTORY,
+            ALERTS_ROOT_DIRECTORY,
         ];
         let directories = ReadDirStream::new(fs::read_dir(&self.root).await?);
         let entries: Vec<DirEntry> = directories.try_collect().await?;
@@ -336,11 +336,7 @@ impl ObjectStorage for LocalFS {
         let logstream_dirs: Vec<Option<String>> =
             FuturesUnordered::from_iter(entries).try_collect().await?;
 
-        let logstreams = logstream_dirs
-            .into_iter()
-            .flatten()
-            .map(|name| LogStream { name })
-            .collect();
+        let logstreams = logstream_dirs.into_iter().flatten().collect();
 
         Ok(logstreams)
     }
@@ -362,75 +358,25 @@ impl ObjectStorage for LocalFS {
         Ok(dirs)
     }
 
-    async fn get_all_dashboards(
+    async fn list_dirs_relative(
         &self,
-    ) -> Result<HashMap<RelativePathBuf, Vec<Bytes>>, ObjectStorageError> {
-        let mut dashboards: HashMap<RelativePathBuf, Vec<Bytes>> = HashMap::new();
-        let users_root_path = self.root.join(USERS_ROOT_DIR);
-        let directories = ReadDirStream::new(fs::read_dir(&users_root_path).await?);
-        let users: Vec<DirEntry> = directories.try_collect().await?;
-        for user in users {
-            if !user.path().is_dir() {
-                continue;
-            }
-            let dashboards_path = users_root_path.join(user.path()).join("dashboards");
-            let directories = ReadDirStream::new(fs::read_dir(&dashboards_path).await?);
-            let dashboards_files: Vec<DirEntry> = directories.try_collect().await?;
-            for dashboard in dashboards_files {
-                let dashboard_absolute_path = dashboard.path();
-                let file = fs::read(dashboard_absolute_path.clone()).await?;
-                let dashboard_relative_path = dashboard_absolute_path
-                    .strip_prefix(self.root.as_path())
-                    .unwrap();
+        relative_path: &RelativePath,
+    ) -> Result<Vec<String>, ObjectStorageError> {
+        let root = self.root.join(relative_path.as_str());
+        let dirs = ReadDirStream::new(fs::read_dir(root).await?)
+            .try_collect::<Vec<DirEntry>>()
+            .await?
+            .into_iter()
+            .map(dir_name);
 
-                dashboards
-                    .entry(RelativePathBuf::from_path(dashboard_relative_path).unwrap())
-                    .or_default()
-                    .push(file.into());
-            }
-        }
-        Ok(dashboards)
-    }
+        let dirs = FuturesUnordered::from_iter(dirs)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
-    async fn get_all_saved_filters(
-        &self,
-    ) -> Result<HashMap<RelativePathBuf, Vec<Bytes>>, ObjectStorageError> {
-        let mut filters: HashMap<RelativePathBuf, Vec<Bytes>> = HashMap::new();
-        let users_root_path = self.root.join(USERS_ROOT_DIR);
-        let directories = ReadDirStream::new(fs::read_dir(&users_root_path).await?);
-        let users: Vec<DirEntry> = directories.try_collect().await?;
-        for user in users {
-            if !user.path().is_dir() {
-                continue;
-            }
-            let stream_root_path = users_root_path.join(user.path()).join("filters");
-            let directories = ReadDirStream::new(fs::read_dir(&stream_root_path).await?);
-            let streams: Vec<DirEntry> = directories.try_collect().await?;
-            for stream in streams {
-                if !stream.path().is_dir() {
-                    continue;
-                }
-                let filters_path = users_root_path
-                    .join(user.path())
-                    .join("filters")
-                    .join(stream.path());
-                let directories = ReadDirStream::new(fs::read_dir(&filters_path).await?);
-                let filters_files: Vec<DirEntry> = directories.try_collect().await?;
-                for filter in filters_files {
-                    let filter_absolute_path = filter.path();
-                    let file = fs::read(filter_absolute_path.clone()).await?;
-                    let filter_relative_path = filter_absolute_path
-                        .strip_prefix(self.root.as_path())
-                        .unwrap();
-
-                    filters
-                        .entry(RelativePathBuf::from_path(filter_relative_path).unwrap())
-                        .or_default()
-                        .push(file.into());
-                }
-            }
-        }
-        Ok(filters)
+        Ok(dirs)
     }
 
     async fn list_dates(&self, stream_name: &str) -> Result<Vec<String>, ObjectStorageError> {

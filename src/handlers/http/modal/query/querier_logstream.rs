@@ -19,7 +19,10 @@
 use core::str;
 use std::fs;
 
-use actix_web::{web, HttpRequest, Responder};
+use actix_web::{
+    web::{self, Path},
+    HttpRequest, Responder,
+};
 use bytes::Bytes;
 use chrono::Utc;
 use http::StatusCode;
@@ -29,7 +32,6 @@ use tracing::{error, warn};
 static CREATE_STREAM_LOCK: Mutex<()> = Mutex::const_new(());
 
 use crate::{
-    event,
     handlers::http::{
         base_path_without_preceding_slash,
         cluster::{
@@ -38,35 +40,33 @@ use crate::{
             utils::{merge_quried_stats, IngestionStats, QueriedStats, StorageStats},
         },
         logstream::{error::StreamError, get_stats_date},
-        modal::utils::logstream_utils::{
-            create_stream_and_schema_from_storage, create_update_stream,
-        },
     },
     hottier::HotTierManager,
-    metadata::{self, STREAM_INFO},
-    option::CONFIG,
+    parseable::{StreamNotFound, PARSEABLE},
     stats::{self, Stats},
-    storage::{StorageDir, StreamType},
+    storage::StreamType,
+    LOCK_EXPECT,
 };
 
-pub async fn delete(req: HttpRequest) -> Result<impl Responder, StreamError> {
-    let stream_name: String = req.match_info().get("logstream").unwrap().parse().unwrap();
+pub async fn delete(stream_name: Path<String>) -> Result<impl Responder, StreamError> {
+    let stream_name = stream_name.into_inner();
 
     // if the stream not found in memory map,
     //check if it exists in the storage
     //create stream and schema from storage
-    if !metadata::STREAM_INFO.stream_exists(&stream_name)
-        && !create_stream_and_schema_from_storage(&stream_name)
+    if !PARSEABLE.streams.contains(&stream_name)
+        && !PARSEABLE
+            .create_stream_and_schema_from_storage(&stream_name)
             .await
             .unwrap_or(false)
     {
-        return Err(StreamError::StreamNotFound(stream_name.clone()));
+        return Err(StreamNotFound(stream_name.clone()).into());
     }
 
-    let objectstore = CONFIG.storage().get_object_store();
-
+    let objectstore = PARSEABLE.storage.get_object_store();
+    // Delete from storage
     objectstore.delete_stream(&stream_name).await?;
-    let stream_dir = StorageDir::new(&stream_name);
+    let stream_dir = PARSEABLE.get_or_create_stream(&stream_name);
     if fs::remove_dir_all(&stream_dir.data_path).is_err() {
         warn!(
             "failed to delete local data for stream {}. Clean {} manually",
@@ -83,7 +83,7 @@ pub async fn delete(req: HttpRequest) -> Result<impl Responder, StreamError> {
 
     let ingestor_metadata = cluster::get_ingestor_info().await.map_err(|err| {
         error!("Fatal: failed to get ingestor info: {:?}", err);
-        StreamError::from(err)
+        err
     })?;
 
     for ingestor in ingestor_metadata {
@@ -98,37 +98,45 @@ pub async fn delete(req: HttpRequest) -> Result<impl Responder, StreamError> {
         cluster::send_stream_delete_request(&url, ingestor.clone()).await?;
     }
 
-    metadata::STREAM_INFO.delete_stream(&stream_name);
-    event::STREAM_WRITERS.delete_stream(&stream_name);
+    // Delete from memory
+    PARSEABLE.streams.delete(&stream_name);
     stats::delete_stats(&stream_name, "json")
         .unwrap_or_else(|e| warn!("failed to delete stats for stream {}: {:?}", stream_name, e));
 
     Ok((format!("log stream {stream_name} deleted"), StatusCode::OK))
 }
 
-pub async fn put_stream(req: HttpRequest, body: Bytes) -> Result<impl Responder, StreamError> {
-    let stream_name: String = req.match_info().get("logstream").unwrap().parse().unwrap();
-
+pub async fn put_stream(
+    req: HttpRequest,
+    stream_name: Path<String>,
+    body: Bytes,
+) -> Result<impl Responder, StreamError> {
+    let stream_name = stream_name.into_inner();
     let _ = CREATE_STREAM_LOCK.lock().await;
-    let headers = create_update_stream(&req, &body, &stream_name).await?;
+    let headers = PARSEABLE
+        .create_update_stream(req.headers(), &body, &stream_name)
+        .await?;
 
     sync_streams_with_ingestors(headers, body, &stream_name).await?;
 
     Ok(("Log stream created", StatusCode::OK))
 }
 
-pub async fn get_stats(req: HttpRequest) -> Result<impl Responder, StreamError> {
-    let stream_name: String = req.match_info().get("logstream").unwrap().parse().unwrap();
-
+pub async fn get_stats(
+    req: HttpRequest,
+    stream_name: Path<String>,
+) -> Result<impl Responder, StreamError> {
+    let stream_name = stream_name.into_inner();
     // if the stream not found in memory map,
     //check if it exists in the storage
     //create stream and schema from storage
-    if !metadata::STREAM_INFO.stream_exists(&stream_name)
-        && !create_stream_and_schema_from_storage(&stream_name)
+    if !PARSEABLE.streams.contains(&stream_name)
+        && !PARSEABLE
+            .create_stream_and_schema_from_storage(&stream_name)
             .await
             .unwrap_or(false)
     {
-        return Err(StreamError::StreamNotFound(stream_name.clone()));
+        return Err(StreamNotFound(stream_name.clone()).into());
     }
 
     let query_string = req.query_string();
@@ -157,20 +165,24 @@ pub async fn get_stats(req: HttpRequest) -> Result<impl Responder, StreamError> 
     }
 
     let stats = stats::get_current_stats(&stream_name, "json")
-        .ok_or(StreamError::StreamNotFound(stream_name.clone()))?;
+        .ok_or_else(|| StreamNotFound(stream_name.clone()))?;
 
-    let ingestor_stats = if STREAM_INFO.stream_type(&stream_name).unwrap()
-        == Some(StreamType::UserDefined.to_string())
+    let ingestor_stats = if PARSEABLE
+        .get_stream(&stream_name)
+        .is_ok_and(|stream| stream.get_stream_type() == StreamType::UserDefined)
     {
         Some(fetch_stats_from_ingestors(&stream_name).await?)
     } else {
         None
     };
 
-    let hash_map = STREAM_INFO.read().expect("Readable");
-    let stream_meta = &hash_map
+    let hash_map = PARSEABLE.streams.read().expect(LOCK_EXPECT);
+    let stream_meta = hash_map
         .get(&stream_name)
-        .ok_or(StreamError::StreamNotFound(stream_name.clone()))?;
+        .ok_or_else(|| StreamNotFound(stream_name.clone()))?
+        .metadata
+        .read()
+        .expect(LOCK_EXPECT);
 
     let time = Utc::now();
 
