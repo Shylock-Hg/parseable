@@ -16,45 +16,49 @@
  *
  */
 
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt::Display,
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion::datasource::listing::ListingTableUrl;
-use datafusion::datasource::object_store::{
-    DefaultObjectStoreRegistry, ObjectStoreRegistry, ObjectStoreUrl,
+use datafusion::{
+    datasource::listing::ListingTableUrl,
+    execution::{
+        object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry, ObjectStoreUrl},
+        runtime_env::RuntimeEnvBuilder,
+    },
 };
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use futures::stream::FuturesUnordered;
-use futures::{StreamExt, TryStreamExt};
-use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, Checksum};
-use object_store::limit::LimitStore;
-use object_store::path::Path as StorePath;
-use object_store::{BackoffConfig, ClientOptions, ObjectStore, PutPayload, RetryConfig};
+use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
+use object_store::{
+    aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, Checksum},
+    limit::LimitStore,
+    path::Path as StorePath,
+    BackoffConfig, ClientOptions, ObjectStore, PutPayload, RetryConfig,
+};
 use relative_path::{RelativePath, RelativePathBuf};
 use tracing::{error, info};
 
-use std::collections::BTreeMap;
-use std::fmt::Display;
-use std::iter::Iterator;
-use std::path::Path as StdPath;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use super::metrics_layer::MetricLayer;
-use super::object_storage::parseable_json_path;
-use super::{
-    ObjectStorageProvider, SCHEMA_FILE_NAME, STREAM_METADATA_FILE_NAME, STREAM_ROOT_DIRECTORY,
+use crate::{
+    handlers::http::users::USERS_ROOT_DIR,
+    metrics::storage::{azureblob::REQUEST_RESPONSE_TIME, StorageMetrics},
+    parseable::LogStream,
 };
-use crate::handlers::http::users::USERS_ROOT_DIR;
-use crate::metrics::storage::{s3::REQUEST_RESPONSE_TIME, StorageMetrics};
-use crate::storage::{LogStream, ObjectStorage, ObjectStorageError, PARSEABLE_ROOT_DIRECTORY};
-use std::collections::HashMap;
 
-#[allow(dead_code)]
+use super::{
+    metrics_layer::MetricLayer, object_storage::parseable_json_path, to_object_store_path,
+    ObjectStorage, ObjectStorageError, ObjectStorageProvider, CONNECT_TIMEOUT_SECS,
+    PARSEABLE_ROOT_DIRECTORY, REQUEST_TIMEOUT_SECS, SCHEMA_FILE_NAME, STREAM_METADATA_FILE_NAME,
+    STREAM_ROOT_DIRECTORY,
+};
+
 // in bytes
-const MULTIPART_UPLOAD_SIZE: usize = 1024 * 1024 * 100;
-const CONNECT_TIMEOUT_SECS: u64 = 5;
-const REQUEST_TIMEOUT_SECS: u64 = 300;
+// const MULTIPART_UPLOAD_SIZE: usize = 1024 * 1024 * 100;
 const AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: &str = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI";
 
 #[derive(Debug, Clone, clap::Args)]
@@ -285,6 +289,10 @@ impl S3Config {
 }
 
 impl ObjectStorageProvider for S3Config {
+    fn name(&self) -> &'static str {
+        "s3"
+    }
+
     fn get_datafusion_runtime(&self) -> RuntimeEnvBuilder {
         let s3 = self.get_default_builder().build().unwrap();
 
@@ -292,7 +300,7 @@ impl ObjectStorageProvider for S3Config {
         let s3 = LimitStore::new(s3, super::MAX_OBJECT_STORE_REQUESTS);
         let s3 = MetricLayer::new(s3);
 
-        let object_store_registry: DefaultObjectStoreRegistry = DefaultObjectStoreRegistry::new();
+        let object_store_registry = DefaultObjectStoreRegistry::new();
         let url = ObjectStoreUrl::parse(format!("s3://{}", &self.bucket_name)).unwrap();
         object_store_registry.register_store(url.as_ref(), Arc::new(s3));
 
@@ -319,10 +327,6 @@ impl ObjectStorageProvider for S3Config {
     fn register_store_metrics(&self, handler: &actix_web_prometheus::PrometheusMetrics) {
         self.register_metrics(handler)
     }
-}
-
-fn to_object_store_path(path: &RelativePath) -> StorePath {
-    StorePath::from(path.as_str())
 }
 
 #[derive(Debug)]
@@ -403,8 +407,8 @@ impl S3 {
         Ok(())
     }
 
-    async fn _list_streams(&self) -> Result<Vec<LogStream>, ObjectStorageError> {
-        let mut result_file_list: Vec<LogStream> = Vec::new();
+    async fn _list_streams(&self) -> Result<HashSet<LogStream>, ObjectStorageError> {
+        let mut result_file_list = HashSet::new();
         let resp = self.client.list_with_delimiter(None).await?;
 
         let streams = resp
@@ -424,7 +428,7 @@ impl S3 {
                 .iter()
                 .any(|name| name.location.filename().unwrap().ends_with("stream.json"))
             {
-                result_file_list.push(LogStream { name: stream });
+                result_file_list.insert(stream);
             }
         }
 
@@ -479,7 +483,7 @@ impl S3 {
         }
         Ok(result_file_list)
     }
-    async fn _upload_file(&self, key: &str, path: &StdPath) -> Result<(), ObjectStorageError> {
+    async fn _upload_file(&self, key: &str, path: &Path) -> Result<(), ObjectStorageError> {
         let instant = Instant::now();
 
         // // TODO: Uncomment this when multipart is fixed
@@ -508,7 +512,7 @@ impl S3 {
     }
 
     // TODO: introduce parallel, multipart-uploads if required
-    // async fn _upload_multipart(&self, key: &str, path: &StdPath) -> Result<(), ObjectStorageError> {
+    // async fn _upload_multipart(&self, key: &str, path: &Path) -> Result<(), ObjectStorageError> {
     //     let mut buf = vec![0u8; MULTIPART_UPLOAD_SIZE / 2];
     //     let mut file = OpenOptions::new().read(true).open(path).await?;
 
@@ -710,19 +714,17 @@ impl ObjectStorage for S3 {
         }
     }
 
-    async fn list_streams(&self) -> Result<Vec<LogStream>, ObjectStorageError> {
-        let streams = self._list_streams().await?;
-
-        Ok(streams)
+    async fn list_streams(&self) -> Result<HashSet<LogStream>, ObjectStorageError> {
+        self._list_streams().await
     }
 
-    async fn list_old_streams(&self) -> Result<Vec<LogStream>, ObjectStorageError> {
+    async fn list_old_streams(&self) -> Result<HashSet<LogStream>, ObjectStorageError> {
         let resp = self.client.list_with_delimiter(None).await?;
 
         let common_prefixes = resp.common_prefixes; // get all dirs
 
         // return prefixes at the root level
-        let dirs: Vec<_> = common_prefixes
+        let dirs: HashSet<_> = common_prefixes
             .iter()
             .filter_map(|path| path.parts().next())
             .map(|name| name.as_ref().to_string())
@@ -739,7 +741,7 @@ impl ObjectStorage for S3 {
 
         stream_json_check.try_collect::<()>().await?;
 
-        Ok(dirs.into_iter().map(|name| LogStream { name }).collect())
+        Ok(dirs)
     }
 
     async fn list_dates(&self, stream_name: &str) -> Result<Vec<String>, ObjectStorageError> {
@@ -757,7 +759,7 @@ impl ObjectStorage for S3 {
         Ok(files)
     }
 
-    async fn upload_file(&self, key: &str, path: &StdPath) -> Result<(), ObjectStorageError> {
+    async fn upload_file(&self, key: &str, path: &Path) -> Result<(), ObjectStorageError> {
         self._upload_file(key, path).await?;
 
         Ok(())
@@ -793,91 +795,19 @@ impl ObjectStorage for S3 {
             .collect::<Vec<_>>())
     }
 
-    async fn get_all_dashboards(
+    async fn list_dirs_relative(
         &self,
-    ) -> Result<HashMap<RelativePathBuf, Vec<Bytes>>, ObjectStorageError> {
-        let mut dashboards: HashMap<RelativePathBuf, Vec<Bytes>> = HashMap::new();
-        let users_root_path = object_store::path::Path::from(USERS_ROOT_DIR);
-        let resp = self
-            .client
-            .list_with_delimiter(Some(&users_root_path))
-            .await?;
+        relative_path: &RelativePath,
+    ) -> Result<Vec<String>, ObjectStorageError> {
+        let prefix = object_store::path::Path::from(relative_path.as_str());
+        let resp = self.client.list_with_delimiter(Some(&prefix)).await?;
 
-        let users = resp
+        Ok(resp
             .common_prefixes
             .iter()
             .flat_map(|path| path.parts())
-            .filter(|name| name.as_ref() != USERS_ROOT_DIR)
             .map(|name| name.as_ref().to_string())
-            .collect::<Vec<_>>();
-        for user in users {
-            let user_dashboard_path = object_store::path::Path::from(format!(
-                "{}/{}/{}",
-                USERS_ROOT_DIR, user, "dashboards"
-            ));
-            let dashboards_path = RelativePathBuf::from(&user_dashboard_path);
-            let dashboard_bytes = self
-                .get_objects(
-                    Some(&dashboards_path),
-                    Box::new(|file_name| file_name.ends_with(".json")),
-                )
-                .await?;
-
-            dashboards
-                .entry(dashboards_path)
-                .or_default()
-                .extend(dashboard_bytes);
-        }
-        Ok(dashboards)
-    }
-
-    async fn get_all_saved_filters(
-        &self,
-    ) -> Result<HashMap<RelativePathBuf, Vec<Bytes>>, ObjectStorageError> {
-        let mut filters: HashMap<RelativePathBuf, Vec<Bytes>> = HashMap::new();
-        let users_root_path = object_store::path::Path::from(USERS_ROOT_DIR);
-        let resp = self
-            .client
-            .list_with_delimiter(Some(&users_root_path))
-            .await?;
-
-        let users = resp
-            .common_prefixes
-            .iter()
-            .flat_map(|path| path.parts())
-            .filter(|name| name.as_ref() != USERS_ROOT_DIR)
-            .map(|name| name.as_ref().to_string())
-            .collect::<Vec<_>>();
-        for user in users {
-            let user_filters_path = object_store::path::Path::from(format!(
-                "{}/{}/{}",
-                USERS_ROOT_DIR, user, "filters"
-            ));
-            let resp = self
-                .client
-                .list_with_delimiter(Some(&user_filters_path))
-                .await?;
-            let streams = resp
-                .common_prefixes
-                .iter()
-                .filter(|name| name.as_ref() != USERS_ROOT_DIR)
-                .map(|name| name.as_ref().to_string())
-                .collect::<Vec<_>>();
-            for stream in streams {
-                let filters_path = RelativePathBuf::from(&stream);
-                let filter_bytes = self
-                    .get_objects(
-                        Some(&filters_path),
-                        Box::new(|file_name| file_name.ends_with(".json")),
-                    )
-                    .await?;
-                filters
-                    .entry(filters_path)
-                    .or_default()
-                    .extend(filter_bytes);
-            }
-        }
-        Ok(filters)
+            .collect::<Vec<_>>())
     }
 
     fn get_bucket_name(&self) -> String {

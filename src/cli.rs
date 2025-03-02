@@ -17,32 +17,23 @@
  */
 
 use clap::Parser;
-use std::path::PathBuf;
+use std::{env, fs, path::PathBuf};
 
 use url::Url;
 
+#[cfg(feature = "kafka")]
+use crate::connectors::kafka::config::KafkaConfig;
+
 use crate::{
     oidc::{self, OpenidConfig},
-    option::{validation, Compression, Mode}, storage::{AzureBlobConfig, FSConfig, S3Config},
+    option::{validation, Compression, Mode},
+    storage::{AzureBlobConfig, FSConfig, S3Config},
 };
-
-#[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
-use crate::kafka::SslProtocol as KafkaSslProtocol;
-
-#[cfg(not(any(
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "macos", target_arch = "aarch64")
-)))]
-use std::string::String as KafkaSslProtocol;
 
 /// Default username and password for Parseable server, used by default for local mode.
 /// NOTE: obviously not recommended for production
 pub const DEFAULT_USERNAME: &str = "admin";
 pub const DEFAULT_PASSWORD: &str = "admin";
-
 
 #[derive(Parser)]
 #[command(
@@ -52,7 +43,7 @@ pub const DEFAULT_PASSWORD: &str = "admin";
     long_about = r#"
 Cloud Native, log analytics platform for modern applications.
 
-Usage: 
+Usage:
 parseable [command] [options..]
 
 
@@ -81,11 +72,11 @@ pub struct Cli {
 #[derive(Parser)]
 pub enum StorageOptions {
     #[command(name = "local-store")]
-     Local(LocalStoreArgs),
-    
+    Local(LocalStoreArgs),
+
     #[command(name = "s3-store")]
     S3(S3StoreArgs),
-    
+
     #[command(name = "blob-store")]
     Blob(BlobStoreArgs),
 }
@@ -96,6 +87,9 @@ pub struct LocalStoreArgs {
     pub options: Options,
     #[command(flatten)]
     pub storage: FSConfig,
+    #[cfg(feature = "kafka")]
+    #[command(flatten)]
+    pub kafka: KafkaConfig,
 }
 
 #[derive(Parser)]
@@ -104,6 +98,9 @@ pub struct S3StoreArgs {
     pub options: Options,
     #[command(flatten)]
     pub storage: S3Config,
+    #[cfg(feature = "kafka")]
+    #[command(flatten)]
+    pub kafka: KafkaConfig,
 }
 
 #[derive(Parser)]
@@ -112,9 +109,12 @@ pub struct BlobStoreArgs {
     pub options: Options,
     #[command(flatten)]
     pub storage: AzureBlobConfig,
+    #[cfg(feature = "kafka")]
+    #[command(flatten)]
+    pub kafka: KafkaConfig,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 pub struct Options {
     // Authentication
     #[arg(long, env = "P_USERNAME", help = "Admin username to be set for this Parseable server", default_value = DEFAULT_USERNAME)]
@@ -125,8 +125,8 @@ pub struct Options {
 
     // Server configuration
     #[arg(
-        long, 
-        env = "P_ADDR", 
+        long,
+        env = "P_ADDR",
         default_value = "0.0.0.0:8000",
         value_parser = validation::socket_addr,
         help = "Address and port for Parseable HTTP(s) server"
@@ -272,7 +272,7 @@ pub struct Options {
     #[arg(
         long = "compression-algo",
         env = "P_PARQUET_COMPRESSION_ALGO",
-        default_value = "lz4",
+        default_value = "lz4_raw",
         value_parser = validation::compression,
         help = "Parquet compression algorithm"
     )]
@@ -294,83 +294,8 @@ pub struct Options {
     )]
     pub ingestor_endpoint: String,
 
-    // OIDC Configuration
-    #[arg(
-        long,
-        long = "oidc-client",
-        env = "P_OIDC_CLIENT_ID",
-        requires = "oidc",
-        group = "oidc",
-        help = "Client id for OIDC provider"
-    )]
-    oidc_client_id: Option<String>,
-
-    #[arg(
-        long,
-        env = "P_OIDC_CLIENT_SECRET",
-        requires = "oidc",
-        group = "oidc",
-        help = "Client secret for OIDC provider"
-    )]
-    oidc_client_secret: Option<String>,
-
-    #[arg(
-        long,
-        env = "P_OIDC_ISSUER",
-        value_parser = validation::url,
-        requires = "oidc",
-        group = "oidc",
-        help = "OIDC provider's host address"
-    )]
-    oidc_issuer: Option<Url>,
-
-    // Kafka configuration (conditionally compiled)
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[arg(long, env = "P_KAFKA_TOPICS", help = "Kafka topics to subscribe to")]
-    pub kafka_topics: Option<String>,
-
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[arg(long, env = "P_KAFKA_HOST", help = "Address and port for Kafka server")]
-    pub kafka_host: Option<String>,
-
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[arg(long, env = "P_KAFKA_GROUP", help = "Kafka group")]
-    pub kafka_group: Option<String>,
-
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[arg(long, env = "P_KAFKA_CLIENT_ID", help = "Kafka client id")]
-    pub kafka_client_id: Option<String>,
-
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[arg(
-        long,
-        env = "P_KAFKA_SECURITY_PROTOCOL",
-        value_parser = validation::kafka_security_protocol,
-        help = "Kafka security protocol"
-    )]
-    pub kafka_security_protocol: Option<KafkaSslProtocol>,
-
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[arg(long, env = "P_KAFKA_PARTITIONS", help = "Kafka partitions")]
-    pub kafka_partitions: Option<String>,
+    #[command(flatten)]
+    pub oidc: Option<OidcConfig>,
 
     // Audit logging
     #[arg(
@@ -381,14 +306,45 @@ pub struct Options {
     )]
     pub audit_logger: Option<Url>,
 
-    #[arg(long ,env = "P_AUDIT_USERNAME", help = "Audit logger username")]
+    #[arg(long, env = "P_AUDIT_USERNAME", help = "Audit logger username")]
     pub audit_username: Option<String>,
 
-    #[arg(long ,env = "P_AUDIT_PASSWORD", help = "Audit logger password")]
+    #[arg(long, env = "P_AUDIT_PASSWORD", help = "Audit logger password")]
     pub audit_password: Option<String>,
 
-    #[arg(long ,env = "P_MS_CLARITY_TAG", help = "Tag for MS Clarity")]
+    #[arg(long, env = "P_MS_CLARITY_TAG", help = "Tag for MS Clarity")]
     pub ms_clarity_tag: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct OidcConfig {
+    #[arg(
+        long = "oidc-client",
+        name = "oidc-client",
+        env = "P_OIDC_CLIENT_ID",
+        required = false,
+        help = "Client id for OIDC provider"
+    )]
+    pub client_id: String,
+
+    #[arg(
+        long = "oidc-client-secret",
+        name = "oidc-client-secret",
+        env = "P_OIDC_CLIENT_SECRET",
+        required = false,
+        help = "Client secret for OIDC provider"
+    )]
+    pub secret: String,
+
+    #[arg(
+        long = "oidc-issuer",
+        name = "oidc-issuer",
+        env = "P_OIDC_ISSUER",
+        required = false,
+        value_parser = validation::url,
+        help = "OIDC provider's host address"
+    )]
+    pub issuer: Url,
 }
 
 impl Options {
@@ -405,24 +361,98 @@ impl Options {
     }
 
     pub fn openid(&self) -> Option<OpenidConfig> {
-        match (&self.oidc_client_id, &self.oidc_client_secret, &self.oidc_issuer) {
-            (Some(id), Some(secret), Some(issuer)) => {
-                let origin = if let Some(url) = self.domain_address.clone() {
-                    oidc::Origin::Production(url)
-                } else {
-                    oidc::Origin::Local {
-                        socket_addr: self.address.clone(),
-                        https: self.tls_cert_path.is_some() && self.tls_key_path.is_some(),
-                    }
-                };
-                Some(OpenidConfig {
-                    id: id.clone(),
-                    secret: secret.clone(),
-                    issuer: issuer.clone(),
-                    origin,
-                })
+        let OidcConfig {
+            secret,
+            client_id,
+            issuer,
+        } = self.oidc.as_ref()?;
+        let origin = if let Some(url) = self.domain_address.clone() {
+            oidc::Origin::Production(url)
+        } else {
+            oidc::Origin::Local {
+                socket_addr: self.address.clone(),
+                https: self.tls_cert_path.is_some() && self.tls_key_path.is_some(),
             }
-            _ => None,
+        };
+        Some(OpenidConfig {
+            id: client_id.clone(),
+            secret: secret.clone(),
+            issuer: issuer.clone(),
+            origin,
+        })
+    }
+
+    pub fn is_default_creds(&self) -> bool {
+        self.username == DEFAULT_USERNAME && self.password == DEFAULT_PASSWORD
+    }
+
+    /// Path to staging directory, ensures that it exists or panics
+    pub fn staging_dir(&self) -> &PathBuf {
+        fs::create_dir_all(&self.local_staging_path)
+            .expect("Should be able to create dir if doesn't exist");
+
+        &self.local_staging_path
+    }
+
+    /// TODO: refactor and document
+    pub fn get_url(&self) -> Url {
+        if self.ingestor_endpoint.is_empty() {
+            return format!(
+                "{}://{}",
+                self.get_scheme(),
+                self.address
+            )
+            .parse::<Url>() // if the value was improperly set, this will panic before hand
+            .unwrap_or_else(|err| {
+                panic!("{err}, failed to parse `{}` as Url. Please set the environment variable `P_ADDR` to `<ip address>:<port>` without the scheme (e.g., 192.168.1.1:8000). Please refer to the documentation: https://logg.ing/env for more details.", self.address)
+            });
         }
+
+        let ingestor_endpoint = &self.ingestor_endpoint;
+
+        if ingestor_endpoint.starts_with("http") {
+            panic!("Invalid value `{}`, please set the environement variable `P_INGESTOR_ENDPOINT` to `<ip address / DNS>:<port>` without the scheme (e.g., 192.168.1.1:8000 or example.com:8000). Please refer to the documentation: https://logg.ing/env for more details.", ingestor_endpoint);
+        }
+
+        let addr_from_env = ingestor_endpoint.split(':').collect::<Vec<&str>>();
+
+        if addr_from_env.len() != 2 {
+            panic!("Invalid value `{}`, please set the environement variable `P_INGESTOR_ENDPOINT` to `<ip address / DNS>:<port>` without the scheme (e.g., 192.168.1.1:8000 or example.com:8000). Please refer to the documentation: https://logg.ing/env for more details.", ingestor_endpoint);
+        }
+
+        let mut hostname = addr_from_env[0].to_string();
+        let mut port = addr_from_env[1].to_string();
+
+        // if the env var value fits the pattern $VAR_NAME:$VAR_NAME
+        // fetch the value from the specified env vars
+        if hostname.starts_with('$') {
+            let var_hostname = hostname[1..].to_string();
+            hostname = env::var(&var_hostname).unwrap_or_default();
+
+            if hostname.is_empty() {
+                panic!("The environement variable `{}` is not set, please set as <ip address / DNS> without the scheme (e.g., 192.168.1.1 or example.com). Please refer to the documentation: https://logg.ing/env for more details.", var_hostname);
+            }
+            if hostname.starts_with("http") {
+                panic!("Invalid value `{}`, please set the environement variable `{}` to `<ip address / DNS>` without the scheme (e.g., 192.168.1.1 or example.com). Please refer to the documentation: https://logg.ing/env for more details.", hostname, var_hostname);
+            } else {
+                hostname = format!("{}://{}", self.get_scheme(), hostname);
+            }
+        }
+
+        if port.starts_with('$') {
+            let var_port = port[1..].to_string();
+            port = env::var(&var_port).unwrap_or_default();
+
+            if port.is_empty() {
+                panic!(
+                    "Port is not set in the environement variable `{}`. Please refer to the documentation: https://logg.ing/env for more details.",
+                    var_port
+                );
+            }
+        }
+
+        format!("{}://{}:{}", self.get_scheme(), hostname, port)
+            .parse::<Url>()
+            .expect("Valid URL")
     }
 }
