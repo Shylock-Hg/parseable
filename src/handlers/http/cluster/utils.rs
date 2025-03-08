@@ -16,17 +16,9 @@
  *
  */
 
-use crate::{
-    handlers::http::{
-        base_path_without_preceding_slash, logstream::error::StreamError, modal::IngestorMetadata,
-    },
-    HTTP_CLIENT,
-};
+use crate::{handlers::http::base_path_without_preceding_slash, HTTP_CLIENT};
 use actix_web::http::header;
 use chrono::{DateTime, Utc};
-use http::StatusCode;
-use itertools::Itertools;
-use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 use url::Url;
@@ -88,22 +80,22 @@ impl ClusterInfo {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IngestionStats {
     pub count: u64,
-    pub size: String,
+    pub size: u64,
     pub format: String,
     pub lifetime_count: u64,
-    pub lifetime_size: String,
+    pub lifetime_size: u64,
     pub deleted_count: u64,
-    pub deleted_size: String,
+    pub deleted_size: u64,
 }
 
 impl IngestionStats {
     pub fn new(
         count: u64,
-        size: String,
+        size: u64,
         lifetime_count: u64,
-        lifetime_size: String,
+        lifetime_size: u64,
         deleted_count: u64,
-        deleted_size: String,
+        deleted_size: u64,
         format: &str,
     ) -> Self {
         Self {
@@ -120,14 +112,14 @@ impl IngestionStats {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct StorageStats {
-    pub size: String,
+    pub size: u64,
     pub format: String,
-    pub lifetime_size: String,
-    pub deleted_size: String,
+    pub lifetime_size: u64,
+    pub deleted_size: u64,
 }
 
 impl StorageStats {
-    pub fn new(size: String, lifetime_size: String, deleted_size: String, format: &str) -> Self {
+    pub fn new(size: u64, lifetime_size: u64, deleted_size: u64, format: &str) -> Self {
         Self {
             size,
             format: format.to_string(),
@@ -150,36 +142,12 @@ pub fn merge_quried_stats(stats: Vec<QueriedStats>) -> QueriedStats {
             .fold(IngestionStats::default(), |acc, x| IngestionStats {
                 count: acc.count + x.count,
 
-                size: format!(
-                    "{} Bytes",
-                    acc.size.split(' ').collect_vec()[0]
-                        .parse::<u64>()
-                        .unwrap_or_default()
-                        + x.size.split(' ').collect_vec()[0]
-                            .parse::<u64>()
-                            .unwrap_or_default()
-                ),
+                size: acc.size + x.size,
                 format: x.format.clone(),
                 lifetime_count: acc.lifetime_count + x.lifetime_count,
-                lifetime_size: format!(
-                    "{} Bytes",
-                    acc.lifetime_size.split(' ').collect_vec()[0]
-                        .parse::<u64>()
-                        .unwrap_or_default()
-                        + x.lifetime_size.split(' ').collect_vec()[0]
-                            .parse::<u64>()
-                            .unwrap_or_default()
-                ),
+                lifetime_size: acc.lifetime_size + x.lifetime_size,
                 deleted_count: acc.deleted_count + x.deleted_count,
-                deleted_size: format!(
-                    "{} Bytes",
-                    acc.deleted_size.split(' ').collect_vec()[0]
-                        .parse::<u64>()
-                        .unwrap_or_default()
-                        + x.deleted_size.split(' ').collect_vec()[0]
-                            .parse::<u64>()
-                            .unwrap_or_default()
-                ),
+                deleted_size: acc.deleted_size + x.deleted_size,
             });
 
     let cumulative_storage =
@@ -187,34 +155,10 @@ pub fn merge_quried_stats(stats: Vec<QueriedStats>) -> QueriedStats {
             .iter()
             .map(|x| &x.storage)
             .fold(StorageStats::default(), |acc, x| StorageStats {
-                size: format!(
-                    "{} Bytes",
-                    acc.size.split(' ').collect_vec()[0]
-                        .parse::<u64>()
-                        .unwrap_or_default()
-                        + x.size.split(' ').collect_vec()[0]
-                            .parse::<u64>()
-                            .unwrap_or_default()
-                ),
+                size: acc.size + x.size,
                 format: x.format.clone(),
-                lifetime_size: format!(
-                    "{} Bytes",
-                    acc.lifetime_size.split(' ').collect_vec()[0]
-                        .parse::<u64>()
-                        .unwrap_or_default()
-                        + x.lifetime_size.split(' ').collect_vec()[0]
-                            .parse::<u64>()
-                            .unwrap_or_default()
-                ),
-                deleted_size: format!(
-                    "{} Bytes",
-                    acc.deleted_size.split(' ').collect_vec()[0]
-                        .parse::<u64>()
-                        .unwrap_or_default()
-                        + x.deleted_size.split(' ').collect_vec()[0]
-                            .parse::<u64>()
-                            .unwrap_or_default()
-                ),
+                lifetime_size: acc.lifetime_size + x.lifetime_size,
+                deleted_size: acc.deleted_size + x.deleted_size,
             });
 
     QueriedStats::new(
@@ -245,65 +189,6 @@ pub async fn check_liveness(domain_name: &str) -> bool {
         .await;
 
     req.is_ok()
-}
-
-/// send a request to the ingestor to fetch its stats
-/// dead for now
-#[allow(dead_code)]
-pub async fn send_stats_request(
-    url: &str,
-    ingestor: IngestorMetadata,
-) -> Result<Option<Response>, StreamError> {
-    if !check_liveness(&ingestor.domain_name).await {
-        return Ok(None);
-    }
-
-    let res = HTTP_CLIENT
-        .get(url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, ingestor.token)
-        .send()
-        .await
-        .map_err(|err| {
-            error!(
-                "Fatal: failed to fetch stats from ingestor: {}\n Error: {:?}",
-                ingestor.domain_name, err
-            );
-
-            StreamError::Network(err)
-        })?;
-
-    if !res.status().is_success() {
-        error!(
-            "failed to forward create stream request to ingestor: {}\nResponse Returned: {:?}",
-            ingestor.domain_name, res
-        );
-        return Err(StreamError::Custom {
-            msg: format!(
-                "failed to forward create stream request to ingestor: {}\nResponse Returned: {:?}",
-                ingestor.domain_name,
-                res.text().await.unwrap_or_default()
-            ),
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-        });
-    }
-
-    Ok(Some(res))
-}
-
-/// domain_name needs to be http://ip:port
-/// dead code for now
-#[allow(dead_code)]
-pub fn ingestor_meta_filename(domain_name: &str) -> String {
-    if domain_name.starts_with("http://") | domain_name.starts_with("https://") {
-        let url = Url::parse(domain_name).unwrap();
-        return format!(
-            "ingestor.{}.{}.json",
-            url.host_str().unwrap(),
-            url.port().unwrap()
-        );
-    }
-    format!("ingestor.{}.json", domain_name)
 }
 
 pub fn to_url_string(str: String) -> String {

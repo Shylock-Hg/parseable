@@ -16,30 +16,34 @@
  *
  */
 
+use object_store::path::Path;
+use relative_path::RelativePath;
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinError;
+
 use crate::{
     catalog::snapshot::Snapshot,
     event::format::LogSource,
-    metadata::{error::stream_info::MetadataError, SchemaVersion},
+    metadata::SchemaVersion,
+    option::StandaloneWithDistributed,
+    parseable::StreamNotFound,
     stats::FullStats,
     utils::json::{deserialize_string_as_true, serialize_bool_as_true},
 };
 
-use chrono::Local;
-use serde::{Deserialize, Serialize};
+use chrono::Utc;
 
 use std::fmt::Debug;
 
 mod azure_blob;
 mod localfs;
 mod metrics_layer;
-pub(crate) mod object_storage;
+pub mod object_storage;
 pub mod retention;
 mod s3;
-pub mod staging;
 mod store_metadata;
 
 use self::retention::Retention;
-pub use self::staging::StorageDir;
 pub use azure_blob::AzureBlobConfig;
 pub use localfs::FSConfig;
 pub use object_storage::{ObjectStorage, ObjectStorageProvider};
@@ -54,17 +58,8 @@ pub const PARSEABLE_METADATA_FILE_NAME: &str = ".parseable.json";
 pub const STREAM_ROOT_DIRECTORY: &str = ".stream";
 pub const PARSEABLE_ROOT_DIRECTORY: &str = ".parseable";
 pub const SCHEMA_FILE_NAME: &str = ".schema";
-pub const ALERT_FILE_NAME: &str = ".alert.json";
+pub const ALERTS_ROOT_DIRECTORY: &str = ".alerts";
 pub const MANIFEST_FILE: &str = "manifest.json";
-pub const CORRELATIONS_ROOT_DIRECTORY: &str = ".correlations";
-
-/// local sync interval to move data.records to /tmp dir of that stream.
-/// 60 sec is a reasonable value.
-pub const LOCAL_SYNC_INTERVAL: u64 = 60;
-
-/// duration used to configure prefix in objectstore and local disk structure
-/// used for storage. Defaults to 1 min.
-pub const OBJECT_STORE_DATA_GRANULARITY: u32 = (LOCAL_SYNC_INTERVAL as u32) / 60;
 
 // max concurrent request allowed for datafusion object store
 const MAX_OBJECT_STORE_REQUESTS: usize = 1000;
@@ -78,6 +73,9 @@ const ACCESS_ALL: &str = "all";
 
 pub const CURRENT_OBJECT_STORE_VERSION: &str = "v5";
 pub const CURRENT_SCHEMA_VERSION: &str = "v5";
+
+const CONNECT_TIMEOUT_SECS: u64 = 5;
+const REQUEST_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectStoreFormat {
@@ -114,9 +112,10 @@ pub struct ObjectStoreFormat {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub static_schema_flag: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hot_tier_enabled: Option<bool>,
-    pub stream_type: Option<String>,
+    #[serde(default)]
+    pub hot_tier_enabled: bool,
+    #[serde(default)]
+    pub stream_type: StreamType,
     #[serde(default)]
     pub log_source: LogSource,
 }
@@ -141,15 +140,26 @@ pub struct StreamInfo {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub static_schema_flag: bool,
-    pub stream_type: Option<String>,
+    #[serde(default)]
+    pub stream_type: StreamType,
     pub log_source: LogSource,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum StreamType {
     #[default]
     UserDefined,
     Internal,
+}
+
+impl From<&str> for StreamType {
+    fn from(stream_type: &str) -> Self {
+        match stream_type {
+            "UserDefined" => Self::UserDefined,
+            "Internal" => Self::Internal,
+            t => panic!("Unexpected stream type: {t}"),
+        }
+    }
 }
 
 impl std::fmt::Display for StreamType {
@@ -196,8 +206,8 @@ impl Default for ObjectStoreFormat {
             version: CURRENT_SCHEMA_VERSION.to_string(),
             schema_version: SchemaVersion::V1, // Newly created streams should be v1
             objectstore_format: CURRENT_OBJECT_STORE_VERSION.to_string(),
-            stream_type: Some(StreamType::UserDefined.to_string()),
-            created_at: Local::now().to_rfc3339(),
+            stream_type: StreamType::UserDefined,
+            created_at: Utc::now().to_rfc3339(),
             first_event_at: None,
             owner: Owner::new("".to_string(), "".to_string()),
             permissions: vec![Permisssion::new("parseable".to_string())],
@@ -208,15 +218,10 @@ impl Default for ObjectStoreFormat {
             time_partition_limit: None,
             custom_partition: None,
             static_schema_flag: false,
-            hot_tier_enabled: None,
+            hot_tier_enabled: false,
             log_source: LogSource::default(),
         }
     }
-}
-
-#[derive(serde::Serialize, PartialEq, Debug)]
-pub struct LogStream {
-    pub name: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -247,10 +252,17 @@ pub enum ObjectStorageError {
     UnhandledError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Error: {0}")]
     PathError(relative_path::FromPathError),
-    #[error("Error: {0}")]
-    MetadataError(#[from] MetadataError),
 
-    #[allow(dead_code)]
-    #[error("Authentication Error: {0}")]
-    AuthenticationError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("{0}")]
+    StreamNotFound(#[from] StreamNotFound),
+
+    #[error("{0}")]
+    StandaloneWithDistributed(#[from] StandaloneWithDistributed),
+
+    #[error("JoinError: {0}")]
+    JoinError(#[from] JoinError),
+}
+
+pub fn to_object_store_path(path: &RelativePath) -> Path {
+    Path::from(path.as_str())
 }

@@ -42,18 +42,17 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, TimestampMillisecondArray, UInt64Array};
 use arrow_schema::Schema;
+use arrow_select::take::take;
+use chrono::{DateTime, Utc};
 use itertools::Itertools;
 
 pub mod batch_adapter;
 pub mod flight;
-pub mod merged_reader;
-pub mod reverse_reader;
 
 use anyhow::Result;
 pub use batch_adapter::adapt_batch;
-pub use merged_reader::MergedRecordReader;
 use serde_json::{Map, Value};
 
 /// Replaces columns in a record batch with new arrays.
@@ -125,6 +124,29 @@ pub fn get_field<'a>(
         .find(|field| field.name() == name)
 }
 
+/// Constructs an array of the current timestamp.
+///
+/// # Arguments
+///
+/// * `size` - The number of rows for which timestamp values are to be added.
+///
+/// # Returns
+///
+/// A column in arrow, containing the current timestamp in millis.
+pub fn get_timestamp_array(p_timestamp: DateTime<Utc>, size: usize) -> TimestampMillisecondArray {
+    TimestampMillisecondArray::from_value(p_timestamp.timestamp_millis(), size)
+}
+
+pub fn reverse(rb: &RecordBatch) -> RecordBatch {
+    let indices = UInt64Array::from_iter_values((0..rb.num_rows()).rev().map(|x| x as u64));
+    let arrays = rb
+        .columns()
+        .iter()
+        .map(|col| take(&col, &indices, None).unwrap())
+        .collect();
+    RecordBatch::try_new(rb.schema(), arrays).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -132,7 +154,7 @@ mod tests {
     use arrow_array::{Array, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::{record_batches_to_json, replace_columns};
+    use super::*;
 
     #[test]
     fn check_replace() {
@@ -169,5 +191,26 @@ mod tests {
         let rb = vec![&r];
         let batches = record_batches_to_json(&rb).unwrap();
         assert_eq!(batches, vec![]);
+    }
+
+    #[test]
+    fn test_timestamp_array_has_correct_size_and_value() {
+        let size = 5;
+        let now = Utc::now();
+
+        let array = get_timestamp_array(now, size);
+
+        assert_eq!(array.len(), size);
+        for i in 0..size {
+            assert!(array.value(i) >= now.timestamp_millis());
+        }
+    }
+
+    #[test]
+    fn test_timestamp_array_with_zero_size() {
+        let array = get_timestamp_array(Utc::now(), 0);
+
+        assert_eq!(array.len(), 0);
+        assert!(array.is_empty());
     }
 }

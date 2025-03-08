@@ -16,7 +16,7 @@
  *
  */
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, Timelike, Utc};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TimeParseError {
@@ -30,6 +30,24 @@ pub enum TimeParseError {
     StartTimeAfterEndTime,
 }
 
+type Prefix = String;
+
+#[derive(Clone, Copy)]
+struct TimeBounds {
+    start_date: NaiveDate,
+    start_hour: u32,
+    start_minute: u32,
+    end_date: NaiveDate,
+    end_hour: u32,
+    end_minute: u32,
+}
+
+impl TimeBounds {
+    fn spans_full_day(&self) -> bool {
+        self.end_hour - self.start_hour >= 24
+    }
+}
+
 /// Represents a range of time with a start and end point.
 #[derive(Debug)]
 pub struct TimeRange {
@@ -38,6 +56,10 @@ pub struct TimeRange {
 }
 
 impl TimeRange {
+    pub fn new(start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
+        TimeRange { start, end }
+    }
+
     /// Parses human-readable time strings into a `TimeRange` object.
     ///
     /// # Arguments
@@ -73,12 +95,236 @@ impl TimeRange {
 
         Ok(Self { start, end })
     }
+
+    /// Generates prefixes for the time period, e.g:
+    /// 1. ("2022-06-11T23:00:01+00:00", "2022-06-12T01:59:59+00:00") => ["date=2022-06-11/hour=23/", "date=2022-06-12/hour=00/", "date=2022-06-12/hour=01/""]
+    /// 2. ("2022-06-11T15:59:00+00:00", "2022-06-11T17:01:00+00:00") => ["date=2022-06-11/hour=15/minute=59/", "date=2022-06-11/hour=16/", "date=2022-06-11/hour=17/minute=00/"]
+    pub fn generate_prefixes(self, data_granularity: u32) -> Vec<Prefix> {
+        let mut prefixes = vec![];
+        let time_bounds = self.calculate_time_bounds();
+        let mut current_date = time_bounds.start_date;
+
+        while current_date <= time_bounds.end_date {
+            self.process_date(data_granularity, current_date, time_bounds, &mut prefixes);
+            current_date += TimeDelta::days(1);
+        }
+
+        prefixes
+    }
+
+    fn calculate_time_bounds(&self) -> TimeBounds {
+        TimeBounds {
+            start_date: self.start.date_naive(),
+            start_hour: self.start.hour(),
+            start_minute: self.start.minute(),
+            end_date: self.end.date_naive(),
+            end_hour: self.end.hour(),
+            end_minute: self.end.minute() + u32::from(self.end.second() > 0),
+        }
+    }
+
+    fn process_date(
+        &self,
+        data_granularity: u32,
+        date: NaiveDate,
+        bounds: TimeBounds,
+        prefixes: &mut Vec<String>,
+    ) {
+        let prefix = format!("date={date}/");
+        let is_start = date == bounds.start_date;
+        let is_end = date == bounds.end_date;
+
+        if !is_start && !is_end {
+            prefixes.push(prefix);
+            return;
+        }
+
+        let time_bounds = self.get_time_bounds(is_start, is_end, bounds);
+        if time_bounds.spans_full_day() {
+            prefixes.push(prefix);
+            return;
+        }
+
+        self.process_hours(data_granularity, prefix, time_bounds, prefixes);
+    }
+
+    fn process_hours(
+        &self,
+        data_granularity: u32,
+        date_prefix: String,
+        time_bounds: TimeBounds,
+        prefixes: &mut Vec<String>,
+    ) {
+        for hour in time_bounds.start_hour..=time_bounds.end_hour {
+            if hour == 24 {
+                break;
+            }
+
+            let hour_prefix = format!("{date_prefix}hour={hour:02}/");
+            let is_start_hour = hour == time_bounds.start_hour;
+            let is_end_hour = hour == time_bounds.end_hour;
+
+            if !is_start_hour && !is_end_hour {
+                prefixes.push(hour_prefix);
+                continue;
+            }
+
+            self.process_minutes(
+                data_granularity,
+                hour_prefix,
+                is_start_hour,
+                is_end_hour,
+                time_bounds,
+                prefixes,
+            );
+        }
+    }
+
+    fn process_minutes(
+        &self,
+        data_granularity: u32,
+        hour_prefix: String,
+        is_start_hour: bool,
+        is_end_hour: bool,
+        mut time_bounds: TimeBounds,
+        prefixes: &mut Vec<String>,
+    ) {
+        if !is_start_hour {
+            time_bounds.start_minute = 0;
+        }
+        if !is_end_hour {
+            time_bounds.end_minute = 60;
+        };
+
+        if time_bounds.start_minute == time_bounds.end_minute {
+            return;
+        }
+
+        let (start_block, end_block) = (
+            time_bounds.start_minute / data_granularity,
+            time_bounds.end_minute / data_granularity,
+        );
+
+        let forbidden_block = 60 / data_granularity;
+        if end_block - start_block >= forbidden_block {
+            prefixes.push(hour_prefix);
+            return;
+        }
+
+        self.generate_minute_prefixes(
+            data_granularity,
+            hour_prefix,
+            start_block,
+            end_block,
+            prefixes,
+        );
+    }
+
+    fn generate_minute_prefixes(
+        &self,
+        data_granularity: u32,
+        hour_prefix: String,
+        start_block: u32,
+        end_block: u32,
+        prefixes: &mut Vec<String>,
+    ) {
+        let mut push_prefix = |block: u32| {
+            if let Ok(minute) = Minute::try_from(block * data_granularity) {
+                let prefix = format!("{hour_prefix}minute={}/", minute.to_slot(data_granularity));
+                prefixes.push(prefix);
+            }
+        };
+
+        for block in start_block..end_block {
+            push_prefix(block);
+        }
+
+        // Handle last block for granularity > 1
+        if data_granularity > 1 {
+            push_prefix(end_block);
+        }
+    }
+
+    fn get_time_bounds(
+        &self,
+        is_start: bool,
+        is_end: bool,
+        mut time_bounds: TimeBounds,
+    ) -> TimeBounds {
+        if !is_start {
+            time_bounds.start_hour = 0;
+            time_bounds.start_minute = 0;
+        }
+
+        if !is_end {
+            time_bounds.end_hour = 24;
+            time_bounds.end_minute = 60;
+        }
+        time_bounds
+    }
+}
+
+/// Represents a minute value (0-59) and provides methods for converting it to a slot range.
+///
+/// # Examples
+///
+/// ```
+/// use crate::utils::time::Minute;
+///
+/// let minute = Minute::try_from(15).unwrap();
+/// assert_eq!(minute.to_slot(10), "10-19");
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct Minute {
+    block: u32,
+}
+
+impl TryFrom<u32> for Minute {
+    type Error = u32;
+
+    /// Returns a Minute if block is an acceptable minute value, else returns it as is
+    fn try_from(block: u32) -> Result<Self, Self::Error> {
+        if block >= 60 {
+            return Err(block);
+        }
+
+        Ok(Self { block })
+    }
+}
+
+impl From<NaiveDateTime> for Minute {
+    fn from(timestamp: NaiveDateTime) -> Self {
+        Self {
+            block: timestamp.minute(),
+        }
+    }
+}
+
+impl Minute {
+    /// Convert minutes to a slot range
+    /// e.g. given minute = 15 and OBJECT_STORE_DATA_GRANULARITY = 10 returns "10-19"
+    ///
+    /// ### PANICS
+    /// If the provided `data_granularity` value isn't cleanly divisble from 60
+    pub fn to_slot(self, data_granularity: u32) -> String {
+        assert!(60 % data_granularity == 0);
+        let block_n = self.block / data_granularity;
+        let block_start = block_n * data_granularity;
+        if data_granularity == 1 {
+            return format!("{block_start:02}");
+        }
+
+        let block_end = (block_n + 1) * data_granularity - 1;
+        format!("{block_start:02}-{block_end:02}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use chrono::{Duration, SecondsFormat, Utc};
+    use rstest::*;
 
     #[test]
     fn valid_rfc3339_timestamps() {
@@ -153,5 +399,118 @@ mod tests {
 
         let result = TimeRange::parse_human_time(start_time, end_time);
         assert!(matches!(result, Err(TimeParseError::HumanTime(_))));
+    }
+
+    fn time_period_from_str(start: &str, end: &str) -> TimeRange {
+        TimeRange {
+            start: DateTime::parse_from_rfc3339(start).unwrap().into(),
+            end: DateTime::parse_from_rfc3339(end).unwrap().into(),
+        }
+    }
+
+    #[rstest]
+    #[case::same_minute(
+        "2022-06-11T16:30:00+00:00", "2022-06-11T16:30:59+00:00",
+        &["date=2022-06-11/hour=16/minute=30/"]
+    )]
+    #[case::same_hour_different_minute(
+        "2022-06-11T16:57:00+00:00", "2022-06-11T16:59:00+00:00",
+        &[
+            "date=2022-06-11/hour=16/minute=57/",
+            "date=2022-06-11/hour=16/minute=58/"
+        ]
+    )]
+    #[case::same_hour_with_00_to_59_minute_block(
+        "2022-06-11T16:00:00+00:00", "2022-06-11T16:59:59+00:00",
+        &["date=2022-06-11/hour=16/"]
+    )]
+    #[case::same_date_different_hours_coherent_minute(
+        "2022-06-11T15:00:00+00:00", "2022-06-11T17:00:00+00:00",
+       &[
+            "date=2022-06-11/hour=15/",
+            "date=2022-06-11/hour=16/"
+        ]
+    )]
+    #[case::same_date_different_hours_incoherent_minutes(
+        "2022-06-11T15:59:00+00:00", "2022-06-11T16:01:00+00:00",
+        &[
+            "date=2022-06-11/hour=15/minute=59/",
+            "date=2022-06-11/hour=16/minute=00/"
+        ]
+    )]
+    #[case::same_date_different_hours_whole_hours_between_incoherent_minutes(
+        "2022-06-11T15:59:00+00:00", "2022-06-11T17:01:00+00:00",
+        &[
+            "date=2022-06-11/hour=15/minute=59/",
+            "date=2022-06-11/hour=16/",
+            "date=2022-06-11/hour=17/minute=00/"
+        ]
+    )]
+    #[case::different_date_coherent_hours_and_minutes(
+        "2022-06-11T00:00:00+00:00", "2022-06-13T00:00:00+00:00",
+        &[
+            "date=2022-06-11/",
+            "date=2022-06-12/"
+        ]
+    )]
+    #[case::different_date_incoherent_hours_coherent_minutes(
+        "2022-06-11T23:00:01+00:00", "2022-06-12T01:59:59+00:00",
+        &[
+            "date=2022-06-11/hour=23/",
+            "date=2022-06-12/hour=00/",
+            "date=2022-06-12/hour=01/"
+        ]
+    )]
+    #[case::different_date_incoherent_hours_incoherent_minutes(
+        "2022-06-11T23:59:59+00:00", "2022-06-12T00:01:00+00:00",
+        &[
+            "date=2022-06-11/hour=23/minute=59/",
+            "date=2022-06-12/hour=00/minute=00/"
+        ]
+    )]
+    fn prefix_generation(#[case] start: &str, #[case] end: &str, #[case] right: &[&str]) {
+        let time_period = time_period_from_str(start, end);
+        let prefixes = time_period.generate_prefixes(1);
+        let left = prefixes.iter().map(String::as_str).collect::<Vec<&str>>();
+        assert_eq!(left.as_slice(), right);
+    }
+
+    #[test]
+    fn valid_minute_to_minute_slot() {
+        let res = Minute::try_from(10);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().to_slot(1), "10");
+    }
+
+    #[test]
+    fn invalid_minute() {
+        assert!(Minute::try_from(100).is_err());
+    }
+
+    #[test]
+    fn minute_from_timestamp() {
+        let timestamp =
+            NaiveDateTime::parse_from_str("2025-01-01 02:03", "%Y-%m-%d %H:%M").unwrap();
+        assert_eq!(Minute::from(timestamp).to_slot(1), "03");
+    }
+
+    #[test]
+    fn slot_5_min_from_timestamp() {
+        let timestamp =
+            NaiveDateTime::parse_from_str("2025-01-01 02:03", "%Y-%m-%d %H:%M").unwrap();
+        assert_eq!(Minute::from(timestamp).to_slot(5), "00-04");
+    }
+
+    #[test]
+    fn slot_30_min_from_timestamp() {
+        let timestamp =
+            NaiveDateTime::parse_from_str("2025-01-01 02:33", "%Y-%m-%d %H:%M").unwrap();
+        assert_eq!(Minute::from(timestamp).to_slot(30), "30-59");
+    }
+
+    #[test]
+    #[should_panic]
+    fn illegal_slot_granularity() {
+        Minute::try_from(0).unwrap().to_slot(40);
     }
 }
